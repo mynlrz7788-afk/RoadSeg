@@ -1,0 +1,268 @@
+import os
+import time
+import datetime
+import json
+import argparse
+import torch
+import torch.optim as optim
+from torch.utils.data import DataLoader
+
+from thop import profile
+from tqdm import tqdm
+import torch.amp
+# 导入组件
+from dataloaders.road_dataset import RoadDataset
+from models import get_model
+from core.loss import BCEDiceLoss
+
+def create_experiment_dir(config):
+    """自动生成日志文件夹"""
+    dataset_name = config['dataset']['name']
+    model_name = config['model']['name']
+    timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    
+    exp_dir = os.path.join('saved_runs', dataset_name, f"{model_name}_{timestamp}")
+    os.makedirs(exp_dir, exist_ok=True)
+    
+    with open(os.path.join(exp_dir, 'config.json'), 'w') as f:
+        json.dump(config, f, indent=4)
+    return exp_dir
+
+def evaluate_model_complexity(model, device, img_size):
+    """评估模型的 Params, FLOPs 和 FPS，并返回数值"""
+    model.eval() 
+    dummy_input = torch.randn(1, 3, img_size, img_size).to(device)
+    
+    macs, params = profile(model, inputs=(dummy_input, ), verbose=False)
+    flops = macs * 2
+    
+    with torch.no_grad():
+        for _ in range(50):
+            _ = model(dummy_input)
+    torch.cuda.synchronize()
+    start_time = time.time()
+    with torch.no_grad():
+        for _ in range(100):
+            _ = model(dummy_input)
+    torch.cuda.synchronize()
+    end_time = time.time()
+    
+    fps = 100.0 / (end_time - start_time)
+    model.train()  
+    
+    # 🌟 新增：把算好的值传出去，不在这个函数里打印了
+    return params, flops, fps
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-c', '--config', type=str, required=True, help='Path to config file')
+    parser.add_argument('-r', '--resume', type=str, default=None, help='Path to latest_model.pth to resume')
+    args = parser.parse_args()
+
+    with open(args.config, 'r') as f:
+        config = json.load(f)
+
+    exp_dir = create_experiment_dir(config)
+    log_file = open(os.path.join(exp_dir, 'train.log'), 'w')
+
+    # 记录系统真实的开始时间
+    start_time_raw = time.time()
+    start_time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    init_msg = f" 实验开始，日志和权重保存在: {exp_dir}\n 训练开始时间: {start_time_str}\n"
+    print(init_msg, end='')
+    log_file.write(init_msg) # 把启动信息写入 log
+    log_file.flush()
+
+    train_dataset = RoadDataset(config['dataset']['root_path'], config['dataset']['name'], mode='train', img_size=config['dataset'].get('input_size', 1024))
+    val_dataset   = RoadDataset(config['dataset']['root_path'], config['dataset']['name'], mode='val', img_size=config['dataset'].get('input_size', 1024))
+    
+    n_workers = config['dataset'].get('num_workers', 4)
+    train_loader = DataLoader(train_dataset, batch_size=config['dataset']['batch_size'], shuffle=True, num_workers=n_workers, pin_memory=True)
+    val_loader   = DataLoader(val_dataset, batch_size=config['dataset']['batch_size'], shuffle=False, num_workers=n_workers, pin_memory=True)
+
+    model = get_model(config['model']).cuda()
+    img_size = config['dataset'].get('input_size', 1024)
+    
+    # 接收返回的数值
+    params, flops, fps = evaluate_model_complexity(model, device='cuda', img_size=img_size)
+    
+    # 制作排版字符串，并同时打印到屏幕和写入 log_file
+    complexity_msg = (
+        f"--------------------------------------------------\n"
+        f" 📊 模型复杂度 @ 输入尺寸: {img_size}x{img_size}\n"
+        f"    - 参数量 (Params):    {params / 1e6:.2f} M\n"
+        f"    - 浮点运算量 (FLOPs): {flops / 1e9:.2f} G\n"
+        f"    - 推理速度 (FPS):     {fps:.2f} 张/秒\n"
+        f"--------------------------------------------------\n"
+    )
+    print(complexity_msg, end='')
+    log_file.write(complexity_msg)
+    log_file.flush() # 强制写入硬盘
+    
+    optimizer = optim.AdamW(model.parameters(), lr=config['training']['lr'], weight_decay=1e-2)
+
+
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=5)
+    criterion = BCEDiceLoss().cuda()
+
+    #  实例化 AMP 的梯度缩放器
+    scaler = torch.amp.GradScaler('cuda')
+
+    start_epoch = 1
+    best_val_loss = float('inf')
+    early_stop_patience = 15
+    epochs_without_improvement = 0
+
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print(f"🔄 发现断点文件，正在恢复: {args.resume}")
+            checkpoint = torch.load(args.resume)
+            
+            start_epoch = checkpoint['epoch'] + 1
+            best_val_loss = checkpoint['best_val_loss']
+            epochs_without_improvement = checkpoint['epochs_without_improvement']
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            # 恢复 scaler 的状态
+            if 'scaler_state_dict' in checkpoint:
+                scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            
+            print(f"成功恢复！将从第 {start_epoch} 轮继续训练...")
+            log_file.write(f"Resumed from {args.resume} at epoch {start_epoch}\n")
+        else:
+            print(f" 找不到断点文件: {args.resume}，将从头开始训练！")
+
+    for epoch in range(start_epoch, config['training']['epochs'] + 1):
+        # --- [A] 训练阶段 ---
+        model.train()
+        train_loss = 0.0
+
+        train_loader_tqdm = tqdm(train_loader, desc=f"Epoch [{epoch}/{config['training']['epochs']}] Train", leave=False)
+        #必须在 train_loader_tqdm 里循环
+        for batch_data in train_loader_tqdm:
+            # 兼容 Dataset 返回 2 个或 3 个变量的情况
+            if len(batch_data) == 3:
+                imgs, masks, _ = batch_data  # 训练时不关心名字，用 _ 扔掉
+            else:
+                imgs, masks = batch_data
+                
+            imgs, masks = imgs.cuda(), masks.cuda()
+            optimizer.zero_grad()
+            
+            # 加入 autocast 混合精度前向传播
+            with torch.amp.autocast('cuda'):
+                preds = model(imgs)
+                loss = criterion(preds, masks) 
+            
+            #  AMP 专用的反向传播和优化步骤
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            
+            train_loss += loss.item()
+            train_loader_tqdm.set_postfix({'loss': f"{loss.item():.4f}"})
+            
+        avg_train_loss = train_loss / len(train_loader)
+        
+        # --- [B] 验证阶段 ---
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            val_loader_tqdm = tqdm(val_loader, desc=f"Epoch [{epoch}/{config['training']['epochs']}] Valid", leave=False)
+            #  在 val_loader_tqdm 里循环
+            for batch_data in val_loader_tqdm:
+                if len(batch_data) == 3:
+                    imgs, masks, _ = batch_data
+                else:
+                    imgs, masks = batch_data
+                    
+                imgs, masks = imgs.cuda(), masks.cuda()
+                
+                #  验证阶段加上 autocast 也会让推理速度翻倍
+                with torch.amp.autocast('cuda'):
+                    preds = model(imgs)
+                    loss = criterion(preds, masks) 
+                
+                val_loss += loss.item()
+                val_loader_tqdm.set_postfix({'loss': f"{loss.item():.4f}"})
+                
+        avg_val_loss = val_loss / len(val_loader)
+        
+        log_msg = f"Epoch [{epoch}/{config['training']['epochs']}] | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}\n"
+        print(log_msg, end='')
+        log_file.write(log_msg)
+        log_file.flush()
+
+        # --- [C] 保存现场与调度 ---
+        scheduler.step(avg_val_loss)
+
+        #先判断有没有破纪录，并更新统计变量
+        is_best = avg_val_loss < best_val_loss
+        if is_best:
+            best_val_loss = avg_val_loss
+            epochs_without_improvement = 0 
+        else:
+            epochs_without_improvement += 1
+
+        # 变量更新完之后，再打包现场字典！这样存进去的才是最新的数据
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'scaler_state_dict': scaler.state_dict(), 
+            'best_val_loss': best_val_loss,
+            'epochs_without_improvement': epochs_without_improvement
+        }
+        
+        # 保存每个 epoch 的最新权重
+        torch.save(checkpoint, os.path.join(exp_dir, 'latest_model.pth'))
+
+        # 打印日志和保存 best_model
+        if is_best:
+            torch.save(checkpoint, os.path.join(exp_dir, 'best_model.pth'))
+            msg = "     验证集 Loss 下降，已保存最佳权重！\n"
+            print(msg, end='')
+            log_file.write(msg)
+        else:
+            msg = f"    ⚠️ 连续 {epochs_without_improvement} 轮没有提升了。\n"
+            print(msg, end='')
+            log_file.write(msg)
+
+        # 检查是否触发早停
+        if epochs_without_improvement >= early_stop_patience:
+            msg = f"🚫 连续 {early_stop_patience} 轮 Loss 未下降，触发早停机制，训练提前结束！\n"
+            print(msg, end='')
+            log_file.write(msg)
+            break
+
+        # 每次循环最后都强制刷新一下日志，防止程序意外中断导致日志丢失
+        log_file.flush()
+
+    # --- [D] 训练彻底结束后的时间统计 ---
+    end_time_raw = time.time()
+    end_time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # 计算总耗时 (秒转换为小时、分钟、秒)
+    duration_sec = end_time_raw - start_time_raw
+    hours, rem = divmod(duration_sec, 3600)
+    minutes, seconds = divmod(rem, 60)
+    duration_str = f"{int(hours)}小时 {int(minutes)}分钟 {int(seconds)}秒"
+
+    # 生成最终的总结报告
+    end_msg = (
+        f"--------------------------------------------------\n"
+        f" 训练结束时间: {end_time_str}\n"
+        f" 整个实验总耗时: {duration_str}\n"
+        f"🎉 实验完成！前往 {exp_dir} 查看结果。\n"
+        f"--------------------------------------------------\n"
+    )
+    
+    print(end_msg, end='')
+    log_file.write(end_msg)
+    log_file.close()
+
+if __name__ == '__main__':
+    main()
