@@ -1,0 +1,22 @@
+{
+    "experiment_name": "UNet Baseline on DeepGlobe",
+    
+    "dataset": {
+        "name": "deepglobe",
+        "root_path": "/home/u2508183004/zyn/datasets",
+        "input_size": 1024,
+        "batch_size": 16,
+        "num_workers": 8
+    },
+
+    "model": {
+        "name": "UNet",
+        "num_classes": 1
+    },
+
+    "training": {
+        "epochs": 150,
+        "lr": 0.0004,
+        "loss_type": "BCE_Dice"
+    }
+}
