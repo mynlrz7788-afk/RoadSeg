@@ -1,0 +1,27 @@
+{
+    "experiment_name": "SAM2MS_Massachusetts_Reproduction",
+    
+    "dataset": {
+        "name": "Massachusetts",
+        "root_path": "/home/u2508183004/zyn/datasets",
+        "input_size": 1024,
+        "batch_size": 16,
+        "num_workers": 8
+    },
+
+    "model": {
+        "name": "SAM2MSnet",
+        "num_classes": 1,
+        "hiera_path": "/home/u2508183004/zyn/RoadSeg/weight/sam2_hiera_large.pt"
+    },
+
+    "training": {
+        "epochs": 200,
+        "lr": 0.0001,
+        "loss_type": "BCE_Dice",
+        "weight_decay": 0.01,
+        "lr_factor": 0.5,
+        "lr_patience": 5,
+        "early_stop_patience": 15
+    }
+}
